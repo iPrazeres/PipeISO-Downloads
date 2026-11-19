@@ -1,0 +1,233 @@
+# PipeISO Publicar — corre no repositório PÚBLICO iPrazeres/PipeISO-Downloads (Actions grátis em repositórios públicos).
+# Vai buscar o código ao repositório privado (iPrazeres/PipeISO), testa, compila o APK e o Windows + instalador e cria a
+# Release vX.Y.Z-bN aqui, com os mesmos anexos do "build.ps1 publicar":
+#   PipeISO_vX.Y.Z-bN.apk, PipeISO_Setup_vX.Y.Z-bN.exe, PipeISO.apk e PipeISO-Setup.exe (links fixos .../releases/latest/download/…).
+#
+# Antes da 1.ª vez (ver as instruções na conversa):
+#   - secret PIPEISO_REPO_TOKEN = token "fine-grained" só de LEITURA (Contents: Read-only) e só do repositório PipeISO.
+#
+# Segurança (o repositório é público e os registos das Actions também):
+#   - só arranca à mão (Run workflow), nunca com pull requests de outras pessoas;
+#   - o código fica só na máquina temporária do GitHub; nada de código é guardado como artifact nem impresso nos registos;
+#   - os ficheiros vão para uma Release em RASCUNHO (só tu a vês) e só ficam públicos no fim, se tudo correu bem.
+name: PipeISO Publicar
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Ramo ou tag do repositório PipeISO a compilar'
+        default: 'main'
+        required: true
+      substituir:
+        description: 'Se a Release desta versão já existir, substituí-la?'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # criar a Release neste repositório (com o token automático do GitHub)
+
+concurrency:
+  group: pipeiso-publicar
+  cancel-in-progress: false
+
+env:
+  SRC_REPO: iPrazeres/PipeISO
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  # 1) Lê a versão do pubspec.yaml e prepara a Release em rascunho
+  preparar:
+    name: Preparar a Release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      num: ${{ steps.v.outputs.num }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PIPEISO_REPO_TOKEN }}
+          persist-credentials: false
+          path: src
+          sparse-checkout: pubspec.yaml
+          sparse-checkout-cone-mode: false
+
+      # 0.6.2+1 -> tag v0.6.2-b1 e número 0.6.2.1 (como o build.ps1)
+      - name: Ler a versão
+        id: v
+        run: |
+          V=$(grep -m1 '^version:' src/pubspec.yaml | sed 's/^version:[[:space:]]*//' | tr -d '\r ')
+          echo "tag=v${V/+/-b}" >> "$GITHUB_OUTPUT"
+          echo "num=${V/+/.}" >> "$GITHUB_OUTPUT"
+          echo "Versão: v${V/+/-b}"
+
+      - name: Criar a Release em rascunho
+        env:
+          TAG: ${{ steps.v.outputs.tag }}
+          SUBST: ${{ inputs.substituir }}
+        run: |
+          R="$GITHUB_REPOSITORY"
+          if DRAFT=$(gh release view "$TAG" -R "$R" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$DRAFT" = "true" ]; then
+              echo "Apaga o rascunho deixado por uma tentativa anterior."
+              gh release delete "$TAG" -R "$R" --yes
+            elif [ "$SUBST" = "true" ]; then
+              echo "A Release $TAG já existe: vai ser substituída."
+              gh release delete "$TAG" -R "$R" --yes --cleanup-tag
+            else
+              echo "::error::A Release $TAG já existe. Sobe a versão no pubspec.yaml ou corre outra vez com 'substituir' ligado."
+              exit 1
+            fi
+          fi
+          gh release create "$TAG" -R "$R" --draft --title "$TAG" --notes "PipeISO $TAG"
+
+  # 2) Testes, análise e APK (Linux)
+  apk:
+    name: Testes e APK
+    needs: preparar
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PIPEISO_REPO_TOKEN }}
+          persist-credentials: false
+          path: src
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21' # com 17 o lint do Gradle rebenta no firebase_core
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Criar a pasta android
+        run: flutter create --platforms=android --project-name pipeiso --org com.pipeiso .
+
+      - name: Aplicar correções da plataforma
+        shell: pwsh
+        run: ./tools/apply_platform_fixes.ps1
+
+      - run: flutter pub get
+
+      - name: Testes do núcleo
+        run: |
+          dart run test/core_test.dart
+          dart run test/editor_test.dart
+          dart run test/mobile_test.dart
+          dart run test/store_test.dart
+          dart run test/export_test.dart
+          (cd licensing/license_core && dart pub get && dart run test/license_core_test.dart)
+
+      - name: Análise do código
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings lib licensing/license_client/lib
+
+      - name: Compilar o APK
+        run: flutter build apk --release
+
+      # o login Google só funciona com a chave fixa (SHA-1 registado no Firebase)
+      - name: Confirmar o SHA-1 de assinatura
+        run: |
+          APKSIGNER=$(ls $ANDROID_HOME/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1 || true)
+          GOT=$("$APKSIGNER" verify --print-certs build/app/outputs/flutter-apk/app-release.apk 2>/dev/null | grep "certificate SHA-1 digest" | head -1 | awk '{print $NF}' || true)
+          echo "SHA-1 do APK: $GOT"
+          if [ "$GOT" != "2a3a904a982dbd45dba624f4ef3c6f5bbbe363b8" ]; then
+            echo "::error::O APK não está assinado com a chave fixa: o login Google ia falhar. Não publico."
+            exit 1
+          fi
+
+      - name: Juntar o APK à Release (rascunho)
+        env:
+          TAG: ${{ needs.preparar.outputs.tag }}
+        run: |
+          mkdir -p ../out
+          cp build/app/outputs/flutter-apk/app-release.apk "../out/PipeISO_$TAG.apk"
+          cp build/app/outputs/flutter-apk/app-release.apk ../out/PipeISO.apk
+          gh release upload "$TAG" "../out/PipeISO_$TAG.apk" ../out/PipeISO.apk -R "$GITHUB_REPOSITORY" --clobber
+
+  # 3) Windows e instalador (em paralelo com o APK)
+  windows:
+    name: Windows e instalador
+    needs: preparar
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PIPEISO_REPO_TOKEN }}
+          persist-credentials: false
+          path: src
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Gerar a pasta windows
+        run: flutter create --platforms=windows --project-name pipeiso .
+
+      - name: Aplicar correções
+        shell: pwsh
+        run: ./tools/apply_platform_fixes.ps1
+
+      - run: flutter pub get
+
+      - name: Análise do código
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings lib
+
+      - run: flutter build windows --release
+
+      - name: Instalar o Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Compilar o instalador
+        shell: pwsh
+        env:
+          TAG: ${{ needs.preparar.outputs.tag }}
+          NUM: ${{ needs.preparar.outputs.num }}
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyFileVersion=$env:TAG" "/DMyNumVersion=$env:NUM" installer\pipeiso.iss
+          if ($LASTEXITCODE -ne 0) { throw "Erro ao compilar o instalador." }
+
+      - name: Juntar o instalador à Release (rascunho)
+        shell: pwsh
+        env:
+          TAG: ${{ needs.preparar.outputs.tag }}
+        run: |
+          $exe = "build\installer\PipeISO_Setup_$env:TAG.exe"
+          if (-not (Test-Path $exe)) { throw "Instalador não encontrado: $exe" }
+          New-Item -ItemType Directory -Force -Path ..\out | Out-Null
+          Copy-Item $exe "..\out\PipeISO_Setup_$env:TAG.exe"
+          Copy-Item $exe ..\out\PipeISO-Setup.exe
+          gh release upload $env:TAG "..\out\PipeISO_Setup_$env:TAG.exe" ..\out\PipeISO-Setup.exe -R $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Erro ao enviar o instalador." }
+
+  # 4) Tudo correu bem: a Release passa a pública e a mais recente (links fixos apontam para ela)
+  publicar:
+    name: Publicar
+    needs: [preparar, apk, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tornar a Release pública
+        env:
+          TAG: ${{ needs.preparar.outputs.tag }}
+        run: |
+          R="$GITHUB_REPOSITORY"
+          gh release edit "$TAG" -R "$R" --draft=false --latest
+          echo "Publicada: $TAG"
+          echo "Links fixos:"
+          echo "  https://github.com/$R/releases/latest/download/PipeISO.apk"
+          echo "  https://github.com/$R/releases/latest/download/PipeISO-Setup.exe"
